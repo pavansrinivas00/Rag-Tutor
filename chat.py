@@ -2,11 +2,13 @@
 
 from pathlib import Path
 import argparse
+import os
 import re
 import sys
 
 import chromadb
 import joblib
+from langchain.chat_models import init_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 
 
@@ -15,6 +17,7 @@ COLLECTION_NAME = "notes"
 VECTORIZER_FILE = CHROMA_DIR / "tfidf_vectorizer.joblib"
 TOP_K = 3
 MIN_KEYWORD_OVERLAP = 1
+DEFAULT_MODEL = "gpt-4o-mini"
 
 STOPWORDS = {
     "a",
@@ -47,8 +50,10 @@ STOPWORDS = {
 }
 
 ANSWER_PROMPT = ChatPromptTemplate.from_template(
-    """You are a tutor. Answer only with facts found in CONTEXT.
-If context is insufficient, say "I don't know based on the notes.".
+    """You are a tutor. Use only the facts in CONTEXT to answer QUESTION.
+Return 2-4 concise sentences tailored to the question.
+Do not quote the context verbatim unless needed.
+If context is insufficient, say exactly: "I don't know based on the notes.".
 
 QUESTION:
 {question}
@@ -59,7 +64,37 @@ CONTEXT:
 )
 
 
-def answer_from_context(question: str, contexts: list[str]) -> str:
+def build_chat_model():
+    """Build an optional chat model for natural-language answer formatting."""
+    model_name = os.getenv("RAG_TUTOR_MODEL", DEFAULT_MODEL)
+    try:
+        return init_chat_model(model_name)
+    except Exception:
+        return None
+
+
+def format_context_fallback(context: str) -> str:
+    """Create a concise non-verbatim answer when no LLM is available."""
+    lines = [line.strip() for line in context.splitlines() if line.strip()]
+    lines = [line for line in lines if not line.startswith("#")]
+
+    statement_lines = [
+        line for line in lines if not line.startswith("-") and not line.endswith(":")
+    ]
+    bullet_lines = [line[1:].strip() for line in lines if line.startswith("-")]
+
+    parts = []
+    if statement_lines:
+        parts.append(statement_lines[0])
+    if len(statement_lines) > 1:
+        parts.append(statement_lines[1])
+    if bullet_lines:
+        parts.append("Mitigations include " + ", ".join(bullet_lines) + ".")
+
+    return " ".join(parts).strip() or "I don't know based on the notes."
+
+
+def answer_from_context(question: str, contexts: list[str], chat_model) -> str:
     """Create a grounded answer string from retrieved contexts only."""
     if not contexts:
         return "I don't know based on the notes."
@@ -70,11 +105,18 @@ def answer_from_context(question: str, contexts: list[str]) -> str:
     if not has_keyword_overlap(question, context_block, MIN_KEYWORD_OVERLAP):
         return "I don't know based on the notes."
 
-    # We format a LangChain prompt to keep answer generation constrained/transparent.
-    _ = ANSWER_PROMPT.format_messages(question=question, context=context_block)
+    messages = ANSWER_PROMPT.format_messages(question=question, context=context_block)
 
-    # Minimal extractive response: return the most relevant chunk(s) verbatim.
-    return "\n\n".join(contexts[:2])
+    if chat_model is not None:
+        try:
+            response = chat_model.invoke(messages)
+            if response and getattr(response, "content", ""):
+                return str(response.content).strip()
+        except Exception:
+            pass
+
+    # Fallback if no LLM is configured/reachable.
+    return format_context_fallback(contexts[0])
 
 
 def tokenize(text: str) -> set[str]:
@@ -93,7 +135,7 @@ def has_keyword_overlap(question: str, context: str, min_overlap: int) -> bool:
     return len(overlap) >= min_overlap
 
 
-def ask_question(question: str, collection: chromadb.Collection, vectorizer) -> tuple[str, list[dict]]:
+def ask_question(question: str, collection: chromadb.Collection, vectorizer, chat_model) -> tuple[str, list[dict]]:
     """Retrieve contexts and format a grounded response for one question."""
     query_embedding = vectorizer.transform([question]).toarray()[0].tolist()
     results = collection.query(
@@ -104,13 +146,13 @@ def ask_question(question: str, collection: chromadb.Collection, vectorizer) -> 
 
     contexts = results["documents"][0]
     metadatas = results["metadatas"][0]
-    answer = answer_from_context(question, contexts)
+    answer = answer_from_context(question, contexts, chat_model)
     return answer, metadatas
 
 
-def print_response(question: str, collection: chromadb.Collection, vectorizer) -> None:
+def print_response(question: str, collection: chromadb.Collection, vectorizer, chat_model) -> None:
     """Print tutor answer and sources for one user question."""
-    answer, metadatas = ask_question(question, collection, vectorizer)
+    answer, metadatas = ask_question(question, collection, vectorizer, chat_model)
 
     print("\nTutor:")
     print(answer)
@@ -149,6 +191,7 @@ def main() -> None:
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     collection = client.get_collection(name=COLLECTION_NAME)
     vectorizer = joblib.load(VECTORIZER_FILE)
+    chat_model = build_chat_model()
 
     # Batch question mode.
     if args.question:
@@ -156,7 +199,7 @@ def main() -> None:
             if not question.strip():
                 continue
             print(f"\nYou: {question.strip()}")
-            print_response(question.strip(), collection, vectorizer)
+            print_response(question.strip(), collection, vectorizer, chat_model)
         return
 
     # Piped stdin mode (useful in non-interactive environments).
@@ -170,7 +213,7 @@ def main() -> None:
                 print("Goodbye!")
                 break
             print(f"\nYou: {question}")
-            print_response(question, collection, vectorizer)
+            print_response(question, collection, vectorizer, chat_model)
         return
 
     # Interactive TTY mode.
@@ -188,7 +231,7 @@ def main() -> None:
         if not question:
             continue
 
-        print_response(question, collection, vectorizer)
+        print_response(question, collection, vectorizer, chat_model)
 
 
 if __name__ == "__main__":
